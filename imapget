@@ -1,0 +1,294 @@
+#!/usr/bin/env perl
+use Email::Filter;
+use File::Basename;
+use Getopt::Std;
+use Modern::Perl; 
+use Net::IMAP::Client;
+use Try::Tiny;
+our (%mails, $msgnum, $mail, $debug, $test, $force_delete_trash); 
+
+
+############## BEGIN USER CONFIGURATION ###########
+
+	my %imap_account = (
+		server => 'mail.example.com',
+		user   => 'daffy',
+		pass   => 'sekr3t',
+		ssl    => 1,          # use SSL
+		port   => 993,        # for IMAP over SSL
+		inbox  => 'INBOX',
+		trash  => 'Trash',
+	);
+
+	my $empty_trash_weekly = 1;
+
+	my $home       = $ENV{HOME};
+	my $maildir    = "$home/Mail";
+	my $msgidcache = "$home/.msgidcache";
+	my $whitelist  = "$home/.whitelist";
+	my $emergency  = "$home/mail_dump";
+	my $script     = basename $0;
+	my $log        = "$home/$script.log";
+
+	my %midcache   = map {chomp; $_ => 1} `tail -200 $msgidcache`;
+	my %personal   = map {lc $_ => 1 } split " ", qx(cat $whitelist);
+
+############## END USER CONFIGURATION #############
+
+	sub filter_chain {
+		no warnings 'uninitialized';
+		my $mail = shift;
+
+############## BEGIN FILTERING RULES ###############
+
+	# throw away mail I definitely don't want
+	
+	return -1
+		if $mail->subject =~ /penis|viagra/i;
+
+	# munge headers for Yahoo lists so replies go to From: address, not list
+	
+	$mail->simple->header_set("Reply-To","")
+		if ($mail->to =~ /yahoogroups.com/i ) ;
+
+	# you need to escape '@' in regex patterns
+	
+	return "nama"
+		if $mail->to =~ /nama\@freelists.org/i
+			or  $mail->cc =~ /nama\@freelists.org/i; 
+	
+	return "debian"
+		if $mail->to =~ /lists.debian.org/i
+			or  $mail->cc =~ /lists.debian.org/i; 
+	
+	return "new"
+		if $mail->from =~ /([^\s<>]+\@[^\s<>]+)/ and $personal{ lc $1 };
+
+	return "other"
+
+	}
+################ END FILTERING RULES ############
+
+
+# make sure only one instance is running
+
+	my @other_instances = grep{ $_ != $$} split " ", qx(pgrep $script);
+	die "another instance of this script is already running" if @other_instances;
+
+# options processing
+
+	my %opts;
+	getopts('tdf', \%opts);
+
+	$test               = $opts{t};
+	$debug              = $opts{d};
+	$force_delete_trash = $opts{f};
+	$test and say "TESTING MODE";
+
+# open log file
+
+	open my $fh, ">>$log" or die "couldn't open $log: $!";
+
+# log into IMAP server
+
+	my $imap = Net::IMAP::Client->new( %imap_account) 
+		or die "Could not connect to IMAP server";
+
+	$imap->login or die('Login failed: ' . $imap->last_error);
+
+# select inbox
+
+	$imap->select($imap_account{inbox});
+
+# fetch message ids
+
+	my $messages = $imap->search('ALL');
+	say( scalar @$messages || 'No', " new messages found.");
+	my %down = map {$_ => 1} (@$messages); # messages to be downloaded
+
+# fetch message summaries and process headers
+
+	if( %down ){
+
+		my $summaries = $imap->get_summaries($messages);
+
+		foreach (@$summaries) {
+			$msgnum = $_->uid;
+			my $from = $mails{$msgnum}->{from}    = join(', ', @{$_->from});
+			my $subj = $mails{$msgnum}->{subject} = $_->subject;
+			$mails{$msgnum}->{mid}     = $_->message_id;
+
+			# get rid of non-ASCII characters 
+
+			$from =~ s/[^[:ascii:]]+//g;  
+			$subj =~ s/[^[:ascii:]]+//g;
+
+			say "from: $from";
+			say "subject: $subj";
+
+			if (exists $midcache{$_->message_id}) {
+				say "(Duplicate)";
+
+				# don't download
+				delete $down{$msgnum}; 
+
+				# delete on host
+				add_to_delete_queue($msgnum);
+			}
+		}
+
+
+		# download messages
+
+		while($msgnum = each %down){
+
+			# fetch full message
+			my $data = $imap->get_rfc822_body($msgnum);
+
+			#print $$data; # it's reference to a scalar
+
+			try { filter($data) };
+			
+			# re-throw if anything than exit filter chain
+			catch { !  /exit filter chain/ and die $_ }
+		}
+		close $fh;
+
+		# skip external changes if testing
+		
+		exit if $test;
+
+		empty_inbox();
+		write_msgid_cache();
+	}
+	delete_trash();
+
+	# execution ends here
+	
+	{ 
+	my @uids; 
+	sub add_to_delete_queue {
+		my $uid = shift;
+		push @uids, $uid;
+	}
+	sub empty_inbox {
+		$imap->copy(\@uids, $imap_account{trash});
+		$imap->add_flags(\@uids, '\\Deleted');
+		$imap->expunge;
+	}
+	}
+	sub delete_trash {
+
+	# this doesn't work for large numbers of messages
+	# due to some bug in Net::IMAP::Client
+
+		my @timedata = localtime(time);
+
+		# delete trash if -f option
+		# delete trash if Sunday between 1:00 and 1:10 AM 
+		
+		return unless $force_delete_trash
+			 or  
+			
+			$empty_trash_weekly
+			and $timedata[6] == 0 
+			and $timedata[2] == 1 
+			and $timedata[1] < 15;
+		say "Emptying $imap_account{trash} folder";
+
+		$imap->select($imap_account{trash});
+		my $messages = $imap->search('ALL');
+		say join "\n","target messages: ", scalar @$messages;
+		$imap->delete_message($messages, '\\Deleted');
+		$imap->expunge;
+	}
+	sub write_msgid_cache {
+		open my $fh, ">", $msgidcache  or die $!;
+		say $fh $_ for keys %midcache;
+		close $fh;
+	}
+	sub filter {
+		no warnings qw(uninitialized);
+		my $msg = shift;
+		my $text = $$msg;
+		$debug and print $text;
+		$mail = Email::Filter->new(
+			data 	  => $text, 
+			emergency => $emergency);
+		$mail->exit(0);
+		my ($folder) = filter_chain($mail);
+		to_folder($folder) unless $folder eq -1; # string test to avoid warning
+	}
+	sub to_folder {
+		my $folder = shift;
+		$folder = join "/", $maildir, $folder;
+		my $date = qx(date);
+		chomp $date;
+		my $logmsg = join $/,"",$date,"from: ".$mail->from, "subject: ".$mail->subject, "delivered to: ". $folder;
+		$mail->accept($folder);
+		$mail->{delivered} and do {
+			my $msgid = $mail->header("Message-ID");
+			$midcache{$msgid}++;
+			$debug and print $logmsg;
+			add_to_delete_queue($msgnum);
+			say $fh $logmsg;
+		};
+		die "exit filter chain";
+	}
+
+1;
+__END__
+
+
+=head1 NAME
+
+B<imapget> - download and filter mail from IMAP host
+
+=head1 SYNOPSIS
+
+B<imapget> [I<options>] 
+
+=head1 DESCRIPTION
+
+B<imapget> will download mail from an IMAP server, 
+filter them according to user-configured rules
+and deliver them to a local mailbox, which may
+be mbox or Maildir format.
+
+Once downloaded, mail on the server is moved to
+the Trash folder.
+
+The Message-IDs of downloaded mails will be cached. Mails
+with duplicate Message-IDs will not be downloaded.
+
+The script will attempt to purge the Trash folder once a
+week.
+
+=head1 OPTIONS
+
+=over 4
+
+=item -t
+
+Test mode, download but don't delete on server
+
+=item -d
+
+Debug mode, output info to terminal
+
+=item -f
+
+Direct the server to purge the Trash folder
+
+=back
+
+=head1 FILTERING
+
+Follow the source code examples for filtering rules, or consult
+Email::Filter(3pm) for details.
+  
+=head1 BUGS
+
+Due to a bug in Net::IMAP::Client, deleting mail on the
+server fails for large numbers of mails. You may want to
+delete mails immediately after downloading them.
